@@ -1,0 +1,19 @@
+{
+    "schema": 1,
+    "format": "star-empire-mod",
+    "mod_id": "dakka",
+    "name": "Dakka",
+    "version": "0.1.3",
+    "author": "wkthedev",
+    "description": "Client-only cosmetic: while you are trained in Way of the Hullbreaker, each of your shots is drawn as a staggered volley of several rounds. Gameplay is unchanged.",
+    "loader_api": 2,
+    "entrypoint": "dakka.main:apply",
+    "files": [
+        "mod/dakka/README.md",
+        "mod/dakka/main.py"
+    ],
+    "dependencies": [],
+    "conflicts": [],
+    "load_after": [],
+    "permissions": []
+}
