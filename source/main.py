@@ -26,10 +26,14 @@ LATERAL_RADIUS_MULT = 1.5   # sideways weave amplitude, in projectile radii
 SIZE_MULT = 2.5             # visual size of each round (radius and glow)
 _LATERAL_PATTERN = (0.0, 1.0, -1.0, 0.5, -0.5, 0.0, 0.8, -0.8)
 
+# Private marker this mod stores in row["wing_shot"]; the client never sends
+# or knows it (real fighter-wing shots are 5/6-tuples).
 _SENTINEL = "hullbreaker_volley"
+_SCALED = "_dakka_scaled"   # row key: volley size already applied
 _HULLBREAKER = "way_of_the_hullbreaker"
 
 _patched = {}
+_mod_logger = [None]
 _ghosts = {}      # ghost id -> (row, expires_at): trailing rounds finishing their flight
 _ghost_seq = [0]
 
@@ -53,8 +57,20 @@ def _tag_rows(host):
     with host._lock:
         if not _is_hullbreaker(host):
             return
-        for row in host._proj_interp.values():
-            if (row.get("wing_shot") is not None
+        for pid, row in list(host._proj_interp.items()):
+            if row.get(_SCALED):
+                continue    # already a volley (motion updates copy the row)
+            wing_shot = row.get("wing_shot")
+            if _is_volley(row):
+                # A full keyframe rebuilt this round's row: it kept our
+                # sentinel (wing_shot is carried over from the prior row) but
+                # radius/glow came back at their wire values. Re-enlarge.
+                host._proj_interp[pid] = dict(
+                    row, radius=max(1, int(round(wing_shot[3]))),
+                    glow_size=float(row.get("glow_size", 0.0) or 0.0) * SIZE_MULT,
+                    **{_SCALED: True})
+                continue
+            if (wing_shot is not None
                     or row.get("owner_id") != own_id
                     or row.get("weapon_kind", "projectile") != "projectile"):
                 continue
@@ -67,10 +83,18 @@ def _tag_rows(host):
                 length = (ux * ux + uy * uy) ** 0.5
             if length < 1e-6:
                 continue
-            row["wing_shot"] = (_SENTINEL, ux / length, uy / length,
-                                float(row.get("radius", 3) or 3) * SIZE_MULT)
-            row["radius"] = max(1, int(round(row.get("radius", 3) * SIZE_MULT)))
-            row["glow_size"] = float(row.get("glow_size", 0.0) or 0.0) * SIZE_MULT
+            base_radius = float(row.get("radius", 3) or 3)
+            # Replace the row rather than mutating it: since 0.5.82 motion
+            # deltas keep a reference to the prior row as an immutable base
+            # (projectile_delta.apply_projectile_motion) and the renderer reads
+            # rows outside the lock.
+            host._proj_interp[pid] = dict(
+                row,
+                wing_shot=(_SENTINEL, ux / length, uy / length,
+                           base_radius * SIZE_MULT),
+                radius=max(1, int(round(base_radius * SIZE_MULT))),
+                glow_size=float(row.get("glow_size", 0.0) or 0.0) * SIZE_MULT,
+                **{_SCALED: True})
 
 
 def _world_offsets(ux, uy, radius):
@@ -137,13 +161,13 @@ def _spawn_ghosts(host, row, now):
 
 def _restore_ghosts(host, now):
     """A keyframe prunes ids the server didn't send; put the ghosts back."""
-    for gid, (ghost, _) in _ghosts.items():
+    for gid, (ghost, expires) in list(_ghosts.items()):
         if gid in host._proj_interp:
             continue
         dt = now - ghost["recv_time"]
-        ghost["x"] += ghost["vx"] * dt
-        ghost["y"] += ghost["vy"] * dt
-        ghost["recv_time"] = now
+        ghost = dict(ghost, x=ghost["x"] + ghost["vx"] * dt,
+                     y=ghost["y"] + ghost["vy"] * dt, recv_time=now)
+        _ghosts[gid] = (ghost, expires)
         host._proj_interp[gid] = ghost
         host._interp_proj.observe(ghost["tpid"], now, ghost["x"], ghost["y"],
                                   ghost["vx"], ghost["vy"], 0.0)
@@ -158,14 +182,14 @@ def _expire_ghosts(host, now):
 
 
 def _wrap_set_projectiles(original):
-    def set_projectiles(self, payload):
+    def set_projectiles(self, *args, **kwargs):
         try:
             with self._lock:
                 before = {pid: row for pid, row in self._proj_interp.items()
                           if _is_volley(row)}
         except Exception:
             before = {}
-        result = original(self, payload)
+        result = original(self, *args, **kwargs)
         try:
             now = time.monotonic()
             with self._lock:
@@ -177,6 +201,7 @@ def _wrap_set_projectiles(original):
         except Exception:
             pass    # cosmetic only; never break projectile replication
         return result
+    set_projectiles.__doc__ = getattr(original, "__doc__", None)
     return set_projectiles
 
 
@@ -191,7 +216,14 @@ def _on_draw(host, pygame, screen, render_target):
 def _on_startup(host, pygame, screen):
     cls = type(host)
     module = sys.modules.get("render_mixin")
-    if module is None or not hasattr(module, "fighter_wing_shot_screen_offsets"):
+    if (module is None
+            or not hasattr(module, "fighter_wing_shot_screen_offsets")
+            or not hasattr(cls, "set_projectiles")
+            or not hasattr(host, "_proj_interp")
+            or not hasattr(host, "_interp_proj")):
+        if _mod_logger[0] is not None:
+            _mod_logger[0].warning(
+                "dakka: client projectile hooks not found; staying vanilla")
         return
     _patched["module"] = module
     _patched["offsets"] = module.fighter_wing_shot_screen_offsets
@@ -210,6 +242,7 @@ def _on_shutdown(*_args, **_kwargs):
 
 
 def apply(api):
+    _mod_logger[0] = api.logger
     api.on("client.startup", _on_startup)
     api.on("client.draw", _on_draw)
     api.on("loader.shutdown", _on_shutdown)
